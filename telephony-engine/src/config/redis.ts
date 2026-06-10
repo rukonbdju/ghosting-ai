@@ -1,10 +1,10 @@
 import { config } from 'dotenv';
 config();
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 
 export const redis = new Redis(process.env.REDIS_URL ?? 'redis://127.0.0.1:6379');
 
-redis.on('error', (err) => console.error('[Redis] Connection error:', err.message));
+redis.on('error', (err: Error) => console.error('[Redis] Connection error:', err.message));
 
 export type CallState = 'idle' | 'listening' | 'processing_stt' | 'processing_llm' | 'processing_tts' | 'speaking';
 
@@ -32,7 +32,7 @@ export async function appendHistory(channelId: string, role: ChatMessage['role']
 
 export async function getHistory(channelId: string): Promise<ChatMessage[]> {
   const entries = await redis.lrange(`call:${channelId}:history`, 0, -1);
-  return entries.map((e) => JSON.parse(e) as ChatMessage);
+  return entries.map((e: string) => JSON.parse(e) as ChatMessage);
 }
 
 export async function deleteCallData(channelId: string): Promise<void> {
