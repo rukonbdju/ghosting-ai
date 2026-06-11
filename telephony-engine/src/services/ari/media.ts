@@ -48,7 +48,11 @@ export class MediaServer {
   registerCall(channelId: string, onSpeechEnd: (pcm: Buffer) => void): void {
     if (this.sessions.has(channelId)) return;
 
-    const vad = new VAD();
+    const vad = new VAD({
+      speechThreshold:  parseInt(process.env.SPEECH_THRESHOLD  ?? '600'),
+      silenceTimeoutMs: parseInt(process.env.VAD_SILENCE_MS    ?? '700'),
+      maxSpeechMs:      parseInt(process.env.VAD_MAX_SPEECH_MS ?? '30000'),
+    });
     vad.on('speech_start', () => log.debug(`[${channelId}] speech_start`));
     vad.on('speech_end', (pcm: Buffer) => {
       log.debug(`[${channelId}] speech_end — ${pcm.length} bytes`);

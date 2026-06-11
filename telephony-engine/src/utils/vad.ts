@@ -2,10 +2,12 @@ import { EventEmitter } from 'events';
 import { rmsEnergy } from './audio-utils.js';
 
 export interface VadOptions {
-  /** RMS amplitude threshold to consider a frame as speech (default: 300) */
+  /** RMS amplitude threshold to consider a frame as speech (default: 600) */
   speechThreshold?: number;
   /** Milliseconds of silence before emitting speech_end (default: 700) */
   silenceTimeoutMs?: number;
+  /** Max milliseconds of continuous speech before forced flush (default: 30000) */
+  maxSpeechMs?: number;
   /** Sample rate of the input PCM in Hz (default: 16000) */
   sampleRate?: number;
   /** Frame duration in ms, must evenly divide input chunks (default: 20) */
@@ -24,17 +26,20 @@ type VadState = 'IDLE' | 'SPEAKING' | 'TRAILING';
 export class VAD extends EventEmitter {
   private readonly speechThreshold: number;
   private readonly silenceTimeoutMs: number;
+  private readonly maxSpeechMs: number;
   private readonly sampleRate: number;
   private readonly frameSamples: number;
 
   private state: VadState = 'IDLE';
   private speechBuffer: Buffer[] = [];
   private silenceTimer: NodeJS.Timeout | null = null;
+  private maxSpeechTimer: NodeJS.Timeout | null = null;
 
   constructor(options: VadOptions = {}) {
     super();
-    this.speechThreshold  = options.speechThreshold  ?? 300;
+    this.speechThreshold  = options.speechThreshold  ?? 600;
     this.silenceTimeoutMs = options.silenceTimeoutMs ?? 700;
+    this.maxSpeechMs      = options.maxSpeechMs      ?? 30000;
     this.sampleRate       = options.sampleRate       ?? 16000;
     const frameDurationMs = options.frameDurationMs  ?? 20;
     this.frameSamples     = Math.round(this.sampleRate * frameDurationMs / 1000);
@@ -42,7 +47,6 @@ export class VAD extends EventEmitter {
 
   feed(chunk: Buffer): void {
     const frameBytes = this.frameSamples * 2;
-    // Process in frame-sized slices; leftover bytes are dropped (tiny at 20ms frames)
     for (let offset = 0; offset + frameBytes <= chunk.length; offset += frameBytes) {
       this._processFrame(chunk.subarray(offset, offset + frameBytes));
     }
@@ -50,6 +54,7 @@ export class VAD extends EventEmitter {
 
   reset(): void {
     this._clearSilenceTimer();
+    this._clearMaxSpeechTimer();
     this.state = 'IDLE';
     this.speechBuffer = [];
   }
@@ -62,6 +67,7 @@ export class VAD extends EventEmitter {
       if (this.state === 'IDLE') {
         this.state = 'SPEAKING';
         this.emit('speech_start');
+        this._startMaxSpeechTimer();
       }
       if (this.state === 'SPEAKING' || this.state === 'TRAILING') {
         this._clearSilenceTimer();
@@ -79,15 +85,19 @@ export class VAD extends EventEmitter {
     }
   }
 
+  private _flush(): void {
+    this._clearSilenceTimer();
+    this._clearMaxSpeechTimer();
+    const buffer = Buffer.concat(this.speechBuffer);
+    this.speechBuffer = [];
+    this.state = 'IDLE';
+    this.emit('speech_end', buffer);
+  }
+
   private _startSilenceTimer(): void {
     this._clearSilenceTimer();
     this.silenceTimer = setTimeout(() => {
-      if (this.state === 'TRAILING') {
-        const buffer = Buffer.concat(this.speechBuffer);
-        this.speechBuffer = [];
-        this.state = 'IDLE';
-        this.emit('speech_end', buffer);
-      }
+      if (this.state === 'TRAILING') this._flush();
     }, this.silenceTimeoutMs);
   }
 
@@ -95,6 +105,21 @@ export class VAD extends EventEmitter {
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
+    }
+  }
+
+  // Safety valve: if speech runs longer than maxSpeechMs, force flush
+  private _startMaxSpeechTimer(): void {
+    this._clearMaxSpeechTimer();
+    this.maxSpeechTimer = setTimeout(() => {
+      if (this.state === 'SPEAKING' || this.state === 'TRAILING') this._flush();
+    }, this.maxSpeechMs);
+  }
+
+  private _clearMaxSpeechTimer(): void {
+    if (this.maxSpeechTimer) {
+      clearTimeout(this.maxSpeechTimer);
+      this.maxSpeechTimer = null;
     }
   }
 }
