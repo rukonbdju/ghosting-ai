@@ -2,7 +2,7 @@ import { config } from 'dotenv';
 config();
 import * as dgram from 'dgram';
 import { VAD } from '../../utils/vad.js';
-import { parseRtpHeader, buildRtpPacket } from '../../utils/audio-utils.js';
+import { parseRtpHeader, buildRtpPacket, ulawToSlin16, slin16ToUlaw } from '../../utils/audio-utils.js';
 import { createLogger } from '../../utils/logger.js';
 
 const log = createLogger('Media');
@@ -12,6 +12,8 @@ interface CallSession {
   vad: VAD;
   /** SSRC latched from first valid RTP packet */
   ssrc: number | null;
+  /** RTP payload type latched on first packet (0=ulaw, 11=slin16, etc.) */
+  payloadType: number | null;
   /** Address of Asterisk's RTP sender — used to send audio back */
   remoteAddress: string | null;
   remotePort: number | null;
@@ -62,6 +64,7 @@ export class MediaServer {
     this.sessions.set(channelId, {
       vad,
       ssrc: null,
+      payloadType: null,
       remoteAddress: null,
       remotePort: null,
       txSeq: Math.floor(Math.random() * 0xffff),
@@ -82,8 +85,8 @@ export class MediaServer {
   }
 
   /**
-   * Sends raw PCM audio back to Asterisk as RTP packets.
-   * Splits into 20ms frames (640 bytes at 16kHz) to match Asterisk's expected ptime.
+   * Sends slin16 PCM audio back to Asterisk as RTP packets.
+   * Automatically encodes to ulaw if the inbound stream was ulaw (native bridge path).
    */
   sendAudio(channelId: string, pcm: Buffer): void {
     const session = this.sessions.get(channelId);
@@ -92,17 +95,31 @@ export class MediaServer {
       return;
     }
 
-    const FRAME_BYTES    = 640;  // 20ms @ 16kHz × 2 bytes/sample
-    const SAMPLES_PER_FRAME = 320;
+    const isUlaw = session.payloadType === 0;
 
-    for (let offset = 0; offset < pcm.length; offset += FRAME_BYTES) {
-      const frame = pcm.subarray(offset, offset + FRAME_BYTES);
-      const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef);
-
-      this.socket.send(packet, session.remotePort, session.remoteAddress);
-
-      session.txSeq       = (session.txSeq + 1) & 0xffff;
-      session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
+    if (isUlaw) {
+      // Encode: slin16 (16kHz) → downsample 2× → ulaw (8kHz), send as PT=0
+      const ulaw = slin16ToUlaw(pcm);
+      const FRAME_BYTES       = 160;  // 20ms @ 8kHz ulaw
+      const SAMPLES_PER_FRAME = 160;
+      for (let offset = 0; offset < ulaw.length; offset += FRAME_BYTES) {
+        const frame  = ulaw.subarray(offset, offset + FRAME_BYTES);
+        const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef, 0);
+        this.socket.send(packet, session.remotePort, session.remoteAddress);
+        session.txSeq       = (session.txSeq + 1) & 0xffff;
+        session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
+      }
+    } else {
+      // Send slin16 as-is with PT=11
+      const FRAME_BYTES       = 640;  // 20ms @ 16kHz × 2 bytes/sample
+      const SAMPLES_PER_FRAME = 320;
+      for (let offset = 0; offset < pcm.length; offset += FRAME_BYTES) {
+        const frame  = pcm.subarray(offset, offset + FRAME_BYTES);
+        const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef, 11);
+        this.socket.send(packet, session.remotePort, session.remoteAddress);
+        session.txSeq       = (session.txSeq + 1) & 0xffff;
+        session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
+      }
     }
   }
 
@@ -118,11 +135,13 @@ export class MediaServer {
       if (session.ssrc === null) {
         // Latch first packet
         session.ssrc          = header.ssrc;
+        session.payloadType   = header.payloadType;
         session.remoteAddress = rinfo.address;
         session.remotePort    = rinfo.port;
         targetSession = session;
         targetId = id;
-        log.debug(`[${id}] SSRC latched: 0x${header.ssrc.toString(16)}, remote ${rinfo.address}:${rinfo.port}`);
+        const codecName = header.payloadType === 0 ? 'ulaw' : header.payloadType === 8 ? 'alaw' : `PT${header.payloadType}`;
+        log.info(`[${id}] SSRC latched: 0x${header.ssrc.toString(16)}, remote ${rinfo.address}:${rinfo.port}, codec=${codecName}`);
         break;
       } else if (session.ssrc === header.ssrc) {
         targetSession = session;
@@ -136,6 +155,9 @@ export class MediaServer {
     const payload = msg.subarray(header.headerLength);
     if (payload.length === 0) return;
 
-    targetSession.vad.feed(payload);
+    // Decode ulaw to slin16 (with 2× 8kHz→16kHz upsample) before feeding VAD.
+    // Asterisk's native bridge often passes through ulaw even when slin16 was requested.
+    const pcm = targetSession.payloadType === 0 ? ulawToSlin16(payload) : payload;
+    targetSession.vad.feed(pcm);
   }
 }

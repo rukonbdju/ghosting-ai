@@ -95,7 +95,7 @@ async function handleCall(client: AriClient, channel: ari.Channel, mediaServer: 
     if (tornDown) return;
 
     try {
-      await runAiPipeline(channelId, pcm, mediaServer);
+      await runAiPipeline(channelId, pcm, mediaServer, () => tornDown);
     } catch (err) {
       log.error(`[${channelId}] AI pipeline error: ${(err as Error).message}`);
     }
@@ -114,6 +114,7 @@ async function runAiPipeline(
   channelId: string,
   pcm: Buffer,
   mediaServer: MediaServer,
+  isTornDown: () => boolean,
 ): Promise<void> {
   // STT
   await setCallState(channelId, 'processing_stt');
@@ -131,9 +132,10 @@ async function runAiPipeline(
 
   let fullReply = '';
   fullReply = await streamResponse(history, async (sentence: string) => {
+    if (isTornDown()) return;
     await setCallState(channelId, 'processing_tts');
     const audio = await synthesize(sentence);
-    if (audio.length > 0) {
+    if (audio.length > 0 && !isTornDown()) {
       await setCallState(channelId, 'speaking');
       mediaServer.sendAudio(channelId, audio);
     }

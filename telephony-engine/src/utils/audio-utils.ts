@@ -72,6 +72,50 @@ export function buildRtpPacket(
   return Buffer.concat([header, payload]);
 }
 
+// μ-law decode table: ulaw byte → int16 PCM sample
+const ULAW_DECODE: number[] = Array.from({ length: 256 }, (_, i) => {
+  const u = ~i & 0xFF;
+  const sign = u & 0x80 ? -1 : 1;
+  const exp  = (u >> 4) & 0x07;
+  const mant = u & 0x0F;
+  const mag  = ((mant << 3) | 0x84) << exp;
+  return sign * (mag - 0x84);
+});
+
+/**
+ * Decode 8-bit μ-law buffer and upsample 8 kHz → 16 kHz (linear interpolation).
+ * Each ulaw byte → 4 output bytes (2 int16 LE samples).
+ */
+export function ulawToSlin16(ulaw: Buffer): Buffer {
+  const out = Buffer.allocUnsafe(ulaw.length * 4);
+  let prev = 0;
+  for (let i = 0; i < ulaw.length; i++) {
+    const curr = ULAW_DECODE[ulaw[i]];
+    out.writeInt16LE((prev + curr) >> 1, i * 4);
+    out.writeInt16LE(curr, i * 4 + 2);
+    prev = curr;
+  }
+  return out;
+}
+
+/**
+ * Encode 16 kHz slin16 buffer to 8 kHz ulaw:
+ * downsample 2× (every other sample) then μ-law encode.
+ */
+export function slin16ToUlaw(pcm: Buffer): Buffer {
+  const out = Buffer.allocUnsafe(pcm.length >> 2); // 4 input bytes → 1 output byte
+  for (let i = 0, j = 0; i < pcm.length; i += 4, j++) {
+    let s = pcm.readInt16LE(i);
+    const sign = s < 0 ? (s = -s, 0x80) : 0;
+    if (s > 32767) s = 32767;
+    s += 0x84;
+    let exp = 7;
+    for (let mask = 0x4000; (s & mask) === 0 && exp > 0; exp--, mask >>= 1) {}
+    out[j] = (~(sign | (exp << 4) | ((s >> (exp + 3)) & 0x0F))) & 0xFF;
+  }
+  return out;
+}
+
 /** Calculate RMS energy of a 16-bit PCM buffer (little-endian samples) */
 export function rmsEnergy(buf: Buffer): number {
   const samples = buf.length >> 1;
