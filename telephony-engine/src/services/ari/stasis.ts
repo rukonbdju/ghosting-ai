@@ -9,7 +9,6 @@ import {
   deleteCallData,
   CallState,
 } from '../../config/redis.js';
-import { CallRecord } from '../../models/CallRecord.js';
 import { transcribe } from '../ai/stt.js';
 import { streamResponse } from '../ai/llm.js';
 import { synthesize } from '../ai/tts.js';
@@ -23,7 +22,7 @@ type AriClient = ari.Client;
 
 async function handleCall(client: AriClient, channel: ari.Channel, mediaServer: MediaServer): Promise<void> {
   const channelId = channel.id;
-  const callerId  = channel.caller?.number ?? 'unknown';
+  const callerId = channel.caller?.number ?? 'unknown';
   const startTime = new Date();
 
   log.info(`[${channelId}] Handling new call from ${callerId}`);
@@ -37,9 +36,9 @@ async function handleCall(client: AriClient, channel: ari.Channel, mediaServer: 
 
     mediaServer.deregisterCall(channelId);
 
-    try { externalChannel?.hangup(); } catch { /* already gone */ }
-    try { bridge?.destroy(); }         catch { /* already gone */ }
-    try { channel.hangup(); }          catch { /* already gone */ }
+    await externalChannel?.hangup().catch(() => { /* already gone */ });
+    await bridge?.destroy().catch(() => { /* already gone */ });
+    await channel.hangup().catch(() => { /* already gone */ });
 
     await saveCallRecord(channelId, callerId, startTime);
     await deleteCallData(channelId);
@@ -79,9 +78,9 @@ async function handleCall(client: AriClient, channel: ari.Channel, mediaServer: 
   let externalChannel: ari.Channel;
   try {
     externalChannel = await client.channels.externalMedia({
-      app:           ariConfig.appName,
+      app: ariConfig.appName,
       external_host: `${process.env.MEDIA_HOST ?? '127.0.0.1'}:${process.env.MEDIA_PORT ?? '9999'}`,
-      format:        'slin16',
+      format: 'slin16',
     });
     await bridge.addChannel({ channel: externalChannel.id });
     log.info(`[${channelId}] ExternalMedia channel created: ${externalChannel.id}`);
@@ -156,8 +155,16 @@ async function saveCallRecord(channelId: string, callerId: string, startTime: Da
     const history = await getHistory(channelId);
     // Strip the system prompt from the saved transcript
     const conversation = history.filter((m) => m.role !== 'system');
-
-    await CallRecord.create({
+    console.log({
+      channelId,
+      callerId: metrics?.callerId ?? callerId,
+      startTime,
+      endTime,
+      durationSeconds,
+      transcript: JSON.stringify(conversation),
+      llmModel: LLM_MODEL,
+    })
+    /* await CallRecord.create({
       channelId,
       callerId: metrics?.callerId ?? callerId,
       startTime,
@@ -165,7 +172,7 @@ async function saveCallRecord(channelId: string, callerId: string, startTime: Da
       durationSeconds,
       transcript: JSON.stringify(conversation),
       llmModel:   LLM_MODEL,
-    });
+    }); */
 
     log.info(`[${channelId}] Call record saved (${durationSeconds}s, ${conversation.length} turns)`);
   } catch (err) {
