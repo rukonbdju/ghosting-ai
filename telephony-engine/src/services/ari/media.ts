@@ -15,8 +15,14 @@ interface JitterEntry {
 
 interface CallSession {
   vad: VAD;
+  ssrc: number | null;
+  payloadType: number | null;
   remoteAddress: string | null;
   remotePort: number | null;
+  txSeq: number;
+  txTimestamp: number;
+  jitterBuf: JitterEntry[];
+  lastSeq: number | null;
   onSpeechEnd: (pcm: Buffer) => void;
   txQueue: Buffer[];
   txInterval: NodeJS.Timeout | null;
@@ -63,8 +69,14 @@ export class MediaServer {
 
     this.sessions.set(channelId, {
       vad,
+      ssrc: null,
+      payloadType: null,
       remoteAddress: null,
       remotePort: null,
+      txSeq: Math.floor(Math.random() * 0xffff),
+      txTimestamp: Math.floor(Math.random() * 0xffffffff),
+      jitterBuf: [],
+      lastSeq: null,
       onSpeechEnd,
       txQueue: [],
       txInterval: null,
@@ -100,14 +112,28 @@ export class MediaServer {
       return;
     }
 
-    log.info(`[${channelId}] Queuing ${pcm.length} bytes for raw UDP playback...`);
+    const isUlaw = session.payloadType === 0;
 
-    const FRAME_BYTES = 640; // 20ms @ 16kHz × 2 bytes/sample
+    const FRAME_BYTES       = isUlaw ? 160 : 640;
+    const SAMPLES_PER_FRAME = isUlaw ? 160 : 320;
+    const pType             = isUlaw ? 0 : 11; // Hardcode 11 for slin16 to prevent CN silence
 
-    // No RTP headers, no swap16. Asterisk expects pure Little Endian slin16.
-    for (let offset = 0; offset < pcm.length; offset += FRAME_BYTES) {
-      const frame = pcm.subarray(offset, offset + FRAME_BYTES);
-      session.txQueue.push(frame);
+    let data: Buffer;
+    if (isUlaw) {
+      data = slin16ToUlaw(pcm);
+    } else {
+      data = Buffer.from(pcm);
+      data.swap16();
+    }
+
+    log.info(`[${channelId}] Queuing ${data.length} bytes for RTP playback...`);
+
+    for (let offset = 0; offset < data.length; offset += FRAME_BYTES) {
+      const frame  = data.subarray(offset, offset + FRAME_BYTES);
+      const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef, pType);
+      session.txQueue.push(packet);
+      session.txSeq       = (session.txSeq + 1) & 0xffff;
+      session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
     }
 
     if (!session.txInterval) {
@@ -119,7 +145,7 @@ export class MediaServer {
             clearInterval(session.txInterval);
             session.txInterval = null;
           }
-          log.info(`[${channelId}] Finished sending audio queue`);
+          log.info(`[${channelId}] Finished sending RTP queue`);
           return;
         }
 
@@ -136,18 +162,23 @@ export class MediaServer {
   }
 
   private _onUdpMessage(msg: Buffer, rinfo: dgram.RemoteInfo): void {
-    if (msg.length === 0) return;
+    const header = parseRtpHeader(msg);
+    if (!header) return;
 
     let session: CallSession | undefined;
 
     for (const [id, s] of this.sessions) {
-      if (s.remoteAddress === null) {
+      if (s.ssrc === null) {
+        if (header.payloadType === 13) return; // Ignore Comfort Noise latching
+        s.ssrc          = header.ssrc;
+        s.payloadType   = header.payloadType;
         s.remoteAddress = rinfo.address;
         s.remotePort    = rinfo.port;
         session = s;
-        log.info(`[${id}] Latched RAW UDP remote ${rinfo.address}:${rinfo.port}`);
+        const codecName  = header.payloadType === 0 ? 'ulaw' : header.payloadType === 8 ? 'alaw' : `PT${header.payloadType}`;
+        log.info(`[${id}] SSRC latched: 0x${header.ssrc.toString(16)}, remote ${rinfo.address}:${rinfo.port}, codec=${codecName}`);
         break;
-      } else if (s.remoteAddress === rinfo.address && s.remotePort === rinfo.port) {
+      } else if (s.ssrc === header.ssrc) {
         session = s;
         break;
       }
@@ -155,7 +186,37 @@ export class MediaServer {
 
     if (!session) return;
 
-    // msg is pure slin16 Little Endian PCM
-    session.vad.feed(msg);
+    const payload = msg.subarray(header.headerLength);
+    if (payload.length === 0) return;
+
+    const JITTER_WINDOW = 4;
+
+    session.jitterBuf.push({ seq: header.sequenceNumber, payload: Buffer.from(payload) });
+
+    session.jitterBuf.sort((a, b) => {
+      const d = ((a.seq - b.seq) + 0x10000) & 0xffff;
+      return d === 0 ? 0 : d < 0x8000 ? -1 : 1;
+    });
+
+    while (session.jitterBuf.length > 0) {
+      const front    = session.jitterBuf[0];
+      const isNext   = session.lastSeq === null ||
+                       ((front.seq - session.lastSeq + 0x10000) & 0xffff) === 1;
+      const isFull   = session.jitterBuf.length >= JITTER_WINDOW;
+
+      if (!isNext && !isFull) break;
+
+      session.jitterBuf.shift();
+      session.lastSeq = front.seq;
+
+      let pcm: Buffer;
+      if (session.payloadType === 0) {
+        pcm = ulawToSlin16(front.payload);
+      } else {
+        pcm = Buffer.from(front.payload);
+        pcm.swap16(); 
+      }
+      session.vad.feed(pcm);
+    }
   }
 }
