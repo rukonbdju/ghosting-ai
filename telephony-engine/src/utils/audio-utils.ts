@@ -116,6 +116,28 @@ export function slin16ToUlaw(pcm: Buffer): Buffer {
   return out;
 }
 
+/**
+ * Resample 16-bit signed little-endian PCM from one rate to another.
+ * Uses linear interpolation — good enough quality for voice.
+ */
+export function resampleSlin16(input: Buffer, fromRate: number, toRate: number): Buffer {
+  if (fromRate === toRate) return input;
+  const inSamples  = input.length >> 1;
+  const outSamples = Math.round(inSamples * toRate / fromRate);
+  const out  = Buffer.allocUnsafe(outSamples * 2);
+  const ratio = (inSamples - 1) / Math.max(outSamples - 1, 1);
+  for (let i = 0; i < outSamples; i++) {
+    const src   = i * ratio;
+    const lo    = Math.floor(src);
+    const hi    = Math.min(lo + 1, inSamples - 1);
+    const frac  = src - lo;
+    const s0    = input.readInt16LE(lo * 2);
+    const s1    = input.readInt16LE(hi * 2);
+    out.writeInt16LE(Math.round(s0 + (s1 - s0) * frac), i * 2);
+  }
+  return out;
+}
+
 /** Calculate RMS energy of a 16-bit PCM buffer (little-endian samples) */
 export function rmsEnergy(buf: Buffer): number {
   const samples = buf.length >> 1;
