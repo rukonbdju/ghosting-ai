@@ -5,8 +5,8 @@ import { resampleSlin16 } from '../../utils/audio-utils.js';
 import { createLogger } from '../../utils/logger.js';
 
 const log = createLogger('TTS');
-const PIPER_BIN         = process.env.PIPER_BIN         ?? 'piper';
-const PIPER_MODEL       = process.env.PIPER_MODEL       ?? '/opt/piper/models/en_US-lessac-medium.onnx';
+const PIPER_BIN = process.env.PIPER_BIN ?? 'piper';
+const PIPER_MODEL = process.env.PIPER_MODEL ?? '/opt/piper/models/en_US-lessac-medium.onnx';
 const PIPER_SAMPLE_RATE = parseInt(process.env.PIPER_SAMPLE_RATE ?? '22050', 10);
 
 /**
@@ -23,7 +23,7 @@ export function synthesize(text: string): Promise<Buffer> {
     log.debug(`Synthesizing: "${text}"`);
 
     const piper = spawn(PIPER_BIN, [
-      '--model',       PIPER_MODEL,
+      '--model', PIPER_MODEL,
       '--output-raw',
       '--quiet',
     ], {
@@ -50,7 +50,7 @@ export function synthesize(text: string): Promise<Buffer> {
       }
       let pcm = Buffer.concat(chunks);
       if (PIPER_SAMPLE_RATE !== 16000) {
-        pcm = resampleSlin16(pcm, PIPER_SAMPLE_RATE, 16000);
+        pcm = resampleSlin16(pcm, PIPER_SAMPLE_RATE, 16000) as Buffer<ArrayBuffer>;
       }
       log.debug(`TTS produced ${pcm.length} bytes of PCM (resampled to 16kHz)`);
       resolve(pcm);

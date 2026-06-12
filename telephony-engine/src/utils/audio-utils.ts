@@ -124,7 +124,7 @@ export function resampleSlin16(input: Buffer, fromRate: number, toRate: number):
   if (fromRate === toRate) return input;
   const inSamples  = input.length >> 1;
   const outSamples = Math.round(inSamples * toRate / fromRate);
-  const out  = Buffer.allocUnsafe(outSamples * 2);
+  const out  = Buffer.alloc(outSamples * 2);
   const ratio = (inSamples - 1) / Math.max(outSamples - 1, 1);
   for (let i = 0; i < outSamples; i++) {
     const src   = i * ratio;
