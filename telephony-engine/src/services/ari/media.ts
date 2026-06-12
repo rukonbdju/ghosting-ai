@@ -31,6 +31,9 @@ interface CallSession {
   lastSeq: number | null;
   /** Callback invoked when VAD detects end of speech */
   onSpeechEnd: (pcm: Buffer) => void;
+  /** Queue for pacing outbound RTP packets */
+  txQueue: Buffer[];
+  txInterval: NodeJS.Timeout | null;
 }
 
 export class MediaServer {
@@ -81,6 +84,8 @@ export class MediaServer {
       jitterBuf: [],
       lastSeq: null,
       onSpeechEnd,
+      txQueue: [],
+      txInterval: null,
     });
 
     log.info(`[${channelId}] session registered`);
@@ -89,6 +94,10 @@ export class MediaServer {
   deregisterCall(channelId: string): void {
     const session = this.sessions.get(channelId);
     if (!session) return;
+    if (session.txInterval) {
+      clearInterval(session.txInterval);
+      session.txInterval = null;
+    }
     session.vad.reset();
     session.vad.removeAllListeners();
     this.sessions.delete(channelId);
@@ -108,29 +117,31 @@ export class MediaServer {
 
     const isUlaw = session.payloadType === 0;
 
-    if (isUlaw) {
-      // Encode: slin16 (16kHz) → downsample 2× → ulaw (8kHz), send as PT=0
-      const ulaw = slin16ToUlaw(pcm);
-      const FRAME_BYTES       = 160;  // 20ms @ 8kHz ulaw
-      const SAMPLES_PER_FRAME = 160;
-      for (let offset = 0; offset < ulaw.length; offset += FRAME_BYTES) {
-        const frame  = ulaw.subarray(offset, offset + FRAME_BYTES);
-        const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef, 0);
-        this.socket.send(packet, session.remotePort, session.remoteAddress);
-        session.txSeq       = (session.txSeq + 1) & 0xffff;
-        session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
-      }
-    } else {
-      // Send slin16 as-is with PT=11
-      const FRAME_BYTES       = 640;  // 20ms @ 16kHz × 2 bytes/sample
-      const SAMPLES_PER_FRAME = 320;
-      for (let offset = 0; offset < pcm.length; offset += FRAME_BYTES) {
-        const frame  = pcm.subarray(offset, offset + FRAME_BYTES);
-        const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef, 11);
-        this.socket.send(packet, session.remotePort, session.remoteAddress);
-        session.txSeq       = (session.txSeq + 1) & 0xffff;
-        session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
-      }
+    const FRAME_BYTES       = isUlaw ? 160 : 640;
+    const SAMPLES_PER_FRAME = isUlaw ? 160 : 320;
+    const pType             = isUlaw ? 0 : 11;
+    const data              = isUlaw ? slin16ToUlaw(pcm) : pcm;
+
+    for (let offset = 0; offset < data.length; offset += FRAME_BYTES) {
+      const frame  = data.subarray(offset, offset + FRAME_BYTES);
+      const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef, pType);
+      session.txQueue.push(packet);
+      session.txSeq       = (session.txSeq + 1) & 0xffff;
+      session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
+    }
+
+    if (!session.txInterval) {
+      session.txInterval = setInterval(() => {
+        if (session.txQueue.length > 0) {
+          const pkt = session.txQueue.shift()!;
+          this.socket.send(pkt, session.remotePort!, session.remoteAddress!);
+        } else {
+          if (session.txInterval) {
+            clearInterval(session.txInterval);
+            session.txInterval = null;
+          }
+        }
+      }, 20);
     }
   }
 
