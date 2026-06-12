@@ -123,7 +123,7 @@ export class MediaServer {
 
     const FRAME_BYTES       = isUlaw ? 160 : 640;
     const SAMPLES_PER_FRAME = isUlaw ? 160 : 320;
-    const pType             = isUlaw ? 0 : 11;
+    const pType             = session.payloadType ?? (isUlaw ? 0 : 11);
 
     let data: Buffer;
     if (isUlaw) {
