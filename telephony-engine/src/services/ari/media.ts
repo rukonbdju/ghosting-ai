@@ -120,7 +120,14 @@ export class MediaServer {
     const FRAME_BYTES       = isUlaw ? 160 : 640;
     const SAMPLES_PER_FRAME = isUlaw ? 160 : 320;
     const pType             = isUlaw ? 0 : 11;
-    const data              = isUlaw ? slin16ToUlaw(pcm) : pcm;
+
+    let data: Buffer;
+    if (isUlaw) {
+      data = slin16ToUlaw(pcm);
+    } else {
+      data = Buffer.from(pcm);
+      data.swap16();
+    }
 
     for (let offset = 0; offset < data.length; offset += FRAME_BYTES) {
       const frame  = data.subarray(offset, offset + FRAME_BYTES);
@@ -205,7 +212,13 @@ export class MediaServer {
       session.jitterBuf.shift();
       session.lastSeq = front.seq;
 
-      const pcm = session.payloadType === 0 ? ulawToSlin16(front.payload) : front.payload;
+      let pcm: Buffer;
+      if (session.payloadType === 0) {
+        pcm = ulawToSlin16(front.payload);
+      } else {
+        pcm = Buffer.from(front.payload);
+        pcm.swap16(); // RTP L16 is Big Endian; we need Little Endian
+      }
       session.vad.feed(pcm);
     }
   }
