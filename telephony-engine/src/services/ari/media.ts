@@ -129,8 +129,7 @@ export class MediaServer {
     if (isUlaw) {
       data = slin16ToUlaw(pcm);
     } else {
-      data = Buffer.from(pcm);
-      data.swap16();
+      data = Buffer.from(pcm); // Keep as Little Endian
     }
 
     for (let offset = 0; offset < data.length; offset += FRAME_BYTES) {
@@ -229,8 +228,7 @@ export class MediaServer {
       if (session.payloadType === 0) {
         pcm = ulawToSlin16(front.payload);
       } else {
-        pcm = Buffer.from(front.payload);
-        pcm.swap16(); // RTP L16 is Big Endian; we need Little Endian
+        pcm = Buffer.from(front.payload); // Keep as Little Endian
       }
       session.vad.feed(pcm);
     }
