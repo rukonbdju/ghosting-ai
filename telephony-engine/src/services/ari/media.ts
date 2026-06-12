@@ -34,6 +34,8 @@ interface CallSession {
   /** Queue for pacing outbound RTP packets */
   txQueue: Buffer[];
   txInterval: NodeJS.Timeout | null;
+  txStartTime: number | null;
+  txSentPackets: number;
 }
 
 export class MediaServer {
@@ -86,6 +88,8 @@ export class MediaServer {
       onSpeechEnd,
       txQueue: [],
       txInterval: null,
+      txStartTime: null,
+      txSentPackets: 0,
     });
 
     log.info(`[${channelId}] session registered`);
@@ -138,17 +142,26 @@ export class MediaServer {
     }
 
     if (!session.txInterval) {
+      session.txStartTime = Date.now();
+      session.txSentPackets = 0;
       session.txInterval = setInterval(() => {
-        if (session.txQueue.length > 0) {
-          const pkt = session.txQueue.shift()!;
-          this.socket.send(pkt, session.remotePort!, session.remoteAddress!);
-        } else {
+        if (session.txQueue.length === 0) {
           if (session.txInterval) {
             clearInterval(session.txInterval);
             session.txInterval = null;
           }
+          return;
         }
-      }, 20);
+
+        const now = Date.now();
+        const expectedPackets = Math.floor((now - session.txStartTime!) / 20) + 1;
+
+        while (session.txSentPackets < expectedPackets && session.txQueue.length > 0) {
+          const pkt = session.txQueue.shift()!;
+          this.socket.send(pkt, session.remotePort!, session.remoteAddress!);
+          session.txSentPackets++;
+        }
+      }, 5);
     }
   }
 
