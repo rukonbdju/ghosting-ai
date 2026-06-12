@@ -81,7 +81,6 @@ async function handleCall(client: AriClient, channel: ari.Channel, mediaServer: 
       app: ariConfig.appName,
       external_host: `${process.env.MEDIA_HOST ?? '127.0.0.1'}:${process.env.MEDIA_PORT ?? '9999'}`,
       format: 'slin16',
-      encapsulation: 'rtp',
     });
     await bridge.addChannel({ channel: externalChannel.id });
     log.info(`[${channelId}] ExternalMedia channel created: ${externalChannel.id}`);
