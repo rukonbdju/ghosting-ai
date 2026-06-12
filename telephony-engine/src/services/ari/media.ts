@@ -8,6 +8,11 @@ import { createLogger } from '../../utils/logger.js';
 const log = createLogger('Media');
 const MEDIA_PORT = parseInt(process.env.MEDIA_PORT ?? '9999', 10);
 
+interface JitterEntry {
+  seq: number;
+  payload: Buffer;
+}
+
 interface CallSession {
   vad: VAD;
   /** SSRC latched from first valid RTP packet */
@@ -20,6 +25,10 @@ interface CallSession {
   /** Rolling sequence/timestamp counters for outbound RTP */
   txSeq: number;
   txTimestamp: number;
+  /** Jitter buffer: holds out-of-order packets until they can be delivered in sequence */
+  jitterBuf: JitterEntry[];
+  /** Last sequence number flushed to VAD */
+  lastSeq: number | null;
   /** Callback invoked when VAD detects end of speech */
   onSpeechEnd: (pcm: Buffer) => void;
 }
@@ -69,6 +78,8 @@ export class MediaServer {
       remotePort: null,
       txSeq: Math.floor(Math.random() * 0xffff),
       txTimestamp: Math.floor(Math.random() * 0xffffffff),
+      jitterBuf: [],
+      lastSeq: null,
       onSpeechEnd,
     });
 
@@ -124,22 +135,18 @@ export class MediaServer {
   }
 
   private _onUdpMessage(msg: Buffer, rinfo: dgram.RemoteInfo): void {
-    // Find session by matching incoming SSRC to latched SSRC, or assign to the first unlatched session
     const header = parseRtpHeader(msg);
     if (!header) return;
 
-    let targetSession: CallSession | undefined;
-    let targetId: string | undefined;
+    let session: CallSession | undefined;
 
-    for (const [id, session] of this.sessions) {
-      if (session.ssrc === null) {
-        // Latch first packet — log everything needed to diagnose codec issues
-        session.ssrc          = header.ssrc;
-        session.payloadType   = header.payloadType;
-        session.remoteAddress = rinfo.address;
-        session.remotePort    = rinfo.port;
-        targetSession = session;
-        targetId = id;
+    for (const [id, s] of this.sessions) {
+      if (s.ssrc === null) {
+        s.ssrc          = header.ssrc;
+        s.payloadType   = header.payloadType;
+        s.remoteAddress = rinfo.address;
+        s.remotePort    = rinfo.port;
+        session = s;
         const codecName  = header.payloadType === 0 ? 'ulaw' : header.payloadType === 8 ? 'alaw' : `PT${header.payloadType}`;
         const firstBytes = msg.subarray(header.headerLength, header.headerLength + 16);
         const hexDump    = Array.from(firstBytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
@@ -151,21 +158,44 @@ export class MediaServer {
           `first16=${hexDump}`
         );
         break;
-      } else if (session.ssrc === header.ssrc) {
-        targetSession = session;
-        targetId = id;
+      } else if (s.ssrc === header.ssrc) {
+        session = s;
         break;
       }
     }
 
-    if (!targetSession) return;
+    if (!session) return;
 
     const payload = msg.subarray(header.headerLength);
     if (payload.length === 0) return;
 
-    // Decode ulaw to slin16 (with 2× 8kHz→16kHz upsample) before feeding VAD.
-    // Asterisk's native bridge often passes through ulaw even when slin16 was requested.
-    const pcm = targetSession.payloadType === 0 ? ulawToSlin16(payload) : payload;
-    targetSession.vad.feed(pcm);
+    // Jitter buffer: sort packets by RTP sequence number before feeding VAD.
+    // Over VPN, packets commonly arrive out of order — without sorting, the
+    // concatenated audio is scrambled and sounds like noise.
+    const JITTER_WINDOW = 4; // packets (~80 ms) — enough to absorb typical VPN reordering
+
+    session.jitterBuf.push({ seq: header.sequenceNumber, payload: Buffer.from(payload) });
+
+    // Keep buffer sorted by sequence number (16-bit wraparound aware)
+    session.jitterBuf.sort((a, b) => {
+      const d = ((a.seq - b.seq) + 0x10000) & 0xffff;
+      return d === 0 ? 0 : d < 0x8000 ? -1 : 1;
+    });
+
+    // Drain packets that are next in sequence, or force-drain when buffer is full
+    while (session.jitterBuf.length > 0) {
+      const front    = session.jitterBuf[0];
+      const isNext   = session.lastSeq === null ||
+                       ((front.seq - session.lastSeq + 0x10000) & 0xffff) === 1;
+      const isFull   = session.jitterBuf.length >= JITTER_WINDOW;
+
+      if (!isNext && !isFull) break;
+
+      session.jitterBuf.shift();
+      session.lastSeq = front.seq;
+
+      const pcm = session.payloadType === 0 ? ulawToSlin16(front.payload) : front.payload;
+      session.vad.feed(pcm);
+    }
   }
 }
