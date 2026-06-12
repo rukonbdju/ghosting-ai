@@ -133,15 +133,23 @@ export class MediaServer {
 
     for (const [id, session] of this.sessions) {
       if (session.ssrc === null) {
-        // Latch first packet
+        // Latch first packet — log everything needed to diagnose codec issues
         session.ssrc          = header.ssrc;
         session.payloadType   = header.payloadType;
         session.remoteAddress = rinfo.address;
         session.remotePort    = rinfo.port;
         targetSession = session;
         targetId = id;
-        const codecName = header.payloadType === 0 ? 'ulaw' : header.payloadType === 8 ? 'alaw' : `PT${header.payloadType}`;
-        log.info(`[${id}] SSRC latched: 0x${header.ssrc.toString(16)}, remote ${rinfo.address}:${rinfo.port}, codec=${codecName}`);
+        const codecName  = header.payloadType === 0 ? 'ulaw' : header.payloadType === 8 ? 'alaw' : `PT${header.payloadType}`;
+        const firstBytes = msg.subarray(header.headerLength, header.headerLength + 16);
+        const hexDump    = Array.from(firstBytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
+        log.info(
+          `[${id}] SSRC latched: 0x${header.ssrc.toString(16)}, ` +
+          `remote ${rinfo.address}:${rinfo.port}, ` +
+          `codec=${codecName}, hdrLen=${header.headerLength}, ` +
+          `payloadLen=${msg.length - header.headerLength}, ` +
+          `first16=${hexDump}`
+        );
         break;
       } else if (session.ssrc === header.ssrc) {
         targetSession = session;
