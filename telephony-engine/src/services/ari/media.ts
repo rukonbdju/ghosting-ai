@@ -15,23 +15,9 @@ interface JitterEntry {
 
 interface CallSession {
   vad: VAD;
-  /** SSRC latched from first valid RTP packet */
-  ssrc: number | null;
-  /** RTP payload type latched on first packet (0=ulaw, 11=slin16, etc.) */
-  payloadType: number | null;
-  /** Address of Asterisk's RTP sender — used to send audio back */
   remoteAddress: string | null;
   remotePort: number | null;
-  /** Rolling sequence/timestamp counters for outbound RTP */
-  txSeq: number;
-  txTimestamp: number;
-  /** Jitter buffer: holds out-of-order packets until they can be delivered in sequence */
-  jitterBuf: JitterEntry[];
-  /** Last sequence number flushed to VAD */
-  lastSeq: number | null;
-  /** Callback invoked when VAD detects end of speech */
   onSpeechEnd: (pcm: Buffer) => void;
-  /** Queue for pacing outbound RTP packets */
   txQueue: Buffer[];
   txInterval: NodeJS.Timeout | null;
   txStartTime: number | null;
@@ -77,14 +63,8 @@ export class MediaServer {
 
     this.sessions.set(channelId, {
       vad,
-      ssrc: null,
-      payloadType: null,
       remoteAddress: null,
       remotePort: null,
-      txSeq: Math.floor(Math.random() * 0xffff),
-      txTimestamp: Math.floor(Math.random() * 0xffffffff),
-      jitterBuf: [],
-      lastSeq: null,
       onSpeechEnd,
       txQueue: [],
       txInterval: null,
@@ -109,8 +89,7 @@ export class MediaServer {
   }
 
   /**
-   * Sends slin16 PCM audio back to Asterisk as RTP packets.
-   * Automatically encodes to ulaw if the inbound stream was ulaw (native bridge path).
+   * Sends slin16 PCM audio back to Asterisk as RAW UDP packets.
    */
   sendAudio(channelId: string, pcm: Buffer): void {
     const session = this.sessions.get(channelId);
@@ -119,26 +98,11 @@ export class MediaServer {
       return;
     }
 
-    const isUlaw = session.payloadType === 0;
+    const FRAME_BYTES = 640; // 20ms @ 16kHz × 2 bytes/sample
 
-    const FRAME_BYTES       = isUlaw ? 160 : 640;
-    const SAMPLES_PER_FRAME = isUlaw ? 160 : 320;
-    const pType             = session.payloadType ?? (isUlaw ? 0 : 11);
-
-    let data: Buffer;
-    if (isUlaw) {
-      data = slin16ToUlaw(pcm);
-    } else {
-      data = Buffer.from(pcm);
-      data.swap16();
-    }
-
-    for (let offset = 0; offset < data.length; offset += FRAME_BYTES) {
-      const frame  = data.subarray(offset, offset + FRAME_BYTES);
-      const packet = buildRtpPacket(frame, session.txSeq, session.txTimestamp, 0xdeadbeef, pType);
-      session.txQueue.push(packet);
-      session.txSeq       = (session.txSeq + 1) & 0xffff;
-      session.txTimestamp = (session.txTimestamp + SAMPLES_PER_FRAME) >>> 0;
+    for (let offset = 0; offset < pcm.length; offset += FRAME_BYTES) {
+      const frame = pcm.subarray(offset, offset + FRAME_BYTES);
+      session.txQueue.push(frame);
     }
 
     if (!session.txInterval) {
@@ -166,30 +130,20 @@ export class MediaServer {
   }
 
   private _onUdpMessage(msg: Buffer, rinfo: dgram.RemoteInfo): void {
-    const header = parseRtpHeader(msg);
-    if (!header) return;
+    if (msg.length === 0) return;
 
     let session: CallSession | undefined;
+    let assignedId: string | null = null;
 
     for (const [id, s] of this.sessions) {
-      if (s.ssrc === null) {
-        s.ssrc          = header.ssrc;
-        s.payloadType   = header.payloadType;
+      if (s.remoteAddress === null) {
         s.remoteAddress = rinfo.address;
         s.remotePort    = rinfo.port;
         session = s;
-        const codecName  = header.payloadType === 0 ? 'ulaw' : header.payloadType === 8 ? 'alaw' : `PT${header.payloadType}`;
-        const firstBytes = msg.subarray(header.headerLength, header.headerLength + 16);
-        const hexDump    = Array.from(firstBytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
-        log.info(
-          `[${id}] SSRC latched: 0x${header.ssrc.toString(16)}, ` +
-          `remote ${rinfo.address}:${rinfo.port}, ` +
-          `codec=${codecName}, hdrLen=${header.headerLength}, ` +
-          `payloadLen=${msg.length - header.headerLength}, ` +
-          `first16=${hexDump}`
-        );
+        assignedId = id;
+        log.info(`[${id}] Latched remote ${rinfo.address}:${rinfo.port}`);
         break;
-      } else if (s.ssrc === header.ssrc) {
+      } else if (s.remoteAddress === rinfo.address && s.remotePort === rinfo.port) {
         session = s;
         break;
       }
@@ -197,42 +151,7 @@ export class MediaServer {
 
     if (!session) return;
 
-    const payload = msg.subarray(header.headerLength);
-    if (payload.length === 0) return;
-
-    // Jitter buffer: sort packets by RTP sequence number before feeding VAD.
-    // Over VPN, packets commonly arrive out of order — without sorting, the
-    // concatenated audio is scrambled and sounds like noise.
-    const JITTER_WINDOW = 4; // packets (~80 ms) — enough to absorb typical VPN reordering
-
-    session.jitterBuf.push({ seq: header.sequenceNumber, payload: Buffer.from(payload) });
-
-    // Keep buffer sorted by sequence number (16-bit wraparound aware)
-    session.jitterBuf.sort((a, b) => {
-      const d = ((a.seq - b.seq) + 0x10000) & 0xffff;
-      return d === 0 ? 0 : d < 0x8000 ? -1 : 1;
-    });
-
-    // Drain packets that are next in sequence, or force-drain when buffer is full
-    while (session.jitterBuf.length > 0) {
-      const front    = session.jitterBuf[0];
-      const isNext   = session.lastSeq === null ||
-                       ((front.seq - session.lastSeq + 0x10000) & 0xffff) === 1;
-      const isFull   = session.jitterBuf.length >= JITTER_WINDOW;
-
-      if (!isNext && !isFull) break;
-
-      session.jitterBuf.shift();
-      session.lastSeq = front.seq;
-
-      let pcm: Buffer;
-      if (session.payloadType === 0) {
-        pcm = ulawToSlin16(front.payload);
-      } else {
-        pcm = Buffer.from(front.payload);
-        pcm.swap16(); // RTP L16 is Big Endian; we need Little Endian
-      }
-      session.vad.feed(pcm);
-    }
+    // msg is pure slin16 Little Endian PCM
+    session.vad.feed(msg);
   }
 }
